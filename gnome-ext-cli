@@ -39,6 +39,71 @@ def send_notification(summary, body, urgency="normal"):
         subprocess.run(["notify-send", "-a", "GNOME Extension Store", "-u", urgency, summary, body], check=False)
     except Exception:
         pass
+VERSION = "1.0.0"
+
+def check_self_update():
+    try:
+        url = "https://raw.githubusercontent.com/extensions-gnome/cli/main/gnome-ext-cli"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (GNOME Extension CLI)'})
+        with urllib.request.urlopen(req, timeout=3) as response:
+            content = response.read().decode('utf-8')
+            
+        import re
+        match = re.search(r'VERSION\s*=\s*["\']([^"\']+)["\']', content)
+        if match:
+            remote_version = match.group(1)
+            if remote_version != VERSION:
+                log_warn(f"A new version of gnome-ext-cli is available: {remote_version} (current: {VERSION})")
+                log_warn("To update the CLI tool, run: gnome-ext-cli self-update")
+                return True
+    except Exception:
+        pass
+    return False
+
+def self_update():
+    log_info("Checking for gnome-ext-cli updates...")
+    try:
+        url = "https://raw.githubusercontent.com/extensions-gnome/cli/main/gnome-ext-cli"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (GNOME Extension CLI)'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            content = response.read().decode('utf-8')
+            
+        import re
+        match = re.search(r'VERSION\s*=\s*["\']([^"\']+)["\']', content)
+        if not match:
+            log_error("Could not parse remote version from raw repository script.")
+            return False
+            
+        remote_version = match.group(1)
+        if remote_version == VERSION:
+            log_success(f"gnome-ext-cli is already up-to-date (v{VERSION}).")
+            return True
+            
+        log_info(f"Updating gnome-ext-cli from v{VERSION} to v{remote_version}...")
+        
+        current_script = Path(__file__).resolve()
+        local_bin_script = Path.home() / ".local" / "bin" / "gnome-ext-cli"
+        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = Path(tmp.name)
+            
+        try:
+            if current_script.exists():
+                shutil.copy2(tmp_path, current_script)
+                current_script.chmod(0o755)
+            if local_bin_script.exists() and local_bin_script != current_script:
+                shutil.copy2(tmp_path, local_bin_script)
+                local_bin_script.chmod(0o755)
+                
+            log_success(f"Successfully updated gnome-ext-cli to v{remote_version}!")
+            return True
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+    except Exception as e:
+        log_error(f"Failed to update gnome-ext-cli: {e}")
+        return False
 
 def fetch_store_db():
     log_info("Fetching extensions database from store...")
@@ -151,6 +216,7 @@ def install_extension(uuid, store_db=None, force=False):
         return False
 
 def check_updates():
+    check_self_update()
     installed = get_installed_extensions()
     if not installed:
         log_info("No GNOME extensions found installed on this system.")
@@ -352,6 +418,186 @@ WantedBy=timers.target
         log_error(f"Failed to setup systemd timer: {e}")
         sys.exit(1)
 
+def run_gui_installer(uuid):
+    import gi
+    gtk_version = None
+    try:
+        gi.require_version('Gtk', '4.0')
+        from gi.repository import Gtk, GLib
+        gtk_version = 4
+    except Exception:
+        try:
+            gi.require_version('Gtk', '3.0')
+            from gi.repository import Gtk, GLib
+            gtk_version = 3
+        except Exception as e:
+            raise RuntimeError(f"Could not load Gtk (GTK3/GTK4): {e}")
+        
+    import threading
+    import queue
+    
+    class InstallWindow:
+        def __init__(self):
+            self.uuid = uuid
+            self.log_queue = queue.Queue()
+            
+            if gtk_version == 4:
+                self.app = Gtk.Application(application_id="es.inled.GnomeExtInstaller")
+                self.app.connect('activate', self.on_activate)
+            else:
+                self.window = Gtk.Window()
+                self.setup_ui()
+                
+        def on_activate(self, app):
+            self.window = Gtk.ApplicationWindow(application=app)
+            self.setup_ui()
+            self.window.present()
+            
+        def setup_ui(self):
+            self.window.set_title(f"Installing {self.uuid}")
+            self.window.set_default_size(500, 350)
+            
+            main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            if gtk_version == 4:
+                main_box.set_margin_start(15)
+                main_box.set_margin_end(15)
+                main_box.set_margin_top(15)
+                main_box.set_margin_bottom(15)
+                self.window.set_child(main_box)
+            else:
+                main_box.set_border_width(15)
+                self.window.add(main_box)
+                
+            self.status_label = Gtk.Label()
+            self.status_label.set_halign(Gtk.Align.START)
+            self.status_label.set_markup(f"<b>Installing Extension:</b> {self.uuid}")
+            if gtk_version == 4:
+                main_box.append(self.status_label)
+            else:
+                main_box.pack_start(self.status_label, False, False, 0)
+                
+            spinner_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            spinner_box.set_halign(Gtk.Align.CENTER)
+            self.spinner = Gtk.Spinner()
+            self.spinner.start()
+            
+            if gtk_version == 4:
+                spinner_box.append(self.spinner)
+            else:
+                spinner_box.pack_start(self.spinner, False, False, 0)
+                
+            self.spinner_label = Gtk.Label(label="Downloading files...")
+            if gtk_version == 4:
+                spinner_box.append(self.spinner_label)
+                main_box.append(spinner_box)
+            else:
+                spinner_box.pack_start(self.spinner_label, False, False, 0)
+                main_box.pack_start(spinner_box, False, False, 0)
+                
+            scroll = Gtk.ScrolledWindow()
+            scroll.set_vexpand(True)
+            scroll.set_hexpand(True)
+            
+            self.text_view = Gtk.TextView()
+            self.text_view.set_editable(False)
+            self.text_view.set_cursor_visible(False)
+            self.text_view.set_wrap_mode(Gtk.WrapMode.WORD)
+            self.text_view.set_monospace(True)
+            
+            if gtk_version == 4:
+                scroll.set_child(self.text_view)
+                main_box.append(scroll)
+            else:
+                scroll.add(self.text_view)
+                main_box.pack_start(scroll, True, True, 0)
+                
+            self.close_button = Gtk.Button(label="Close")
+            self.close_button.set_halign(Gtk.Align.END)
+            self.close_button.connect('clicked', lambda btn: self.window.close() if gtk_version == 4 else Gtk.main_quit())
+            self.close_button.set_sensitive(False)
+            
+            if gtk_version == 4:
+                main_box.append(self.close_button)
+            else:
+                main_box.pack_start(self.close_button, False, False, 0)
+                self.window.connect('destroy', Gtk.main_quit)
+                self.window.show_all()
+                
+            GLib.timeout_add(100, self.check_log_queue)
+            
+            self.install_thread = threading.Thread(target=self.run_install)
+            self.install_thread.start()
+            
+        def check_log_queue(self):
+            try:
+                while True:
+                    msg_type, msg = self.log_queue.get_nowait()
+                    
+                    buffer = self.text_view.get_buffer()
+                    end_iter = buffer.get_end_iter()
+                    # Strip color ANSI codes for clean textview display
+                    clean_msg = msg.replace("\033[92m", "").replace("\033[93m", "").replace("\033[91m", "").replace("\033[94m", "").replace("\033[1m", "").replace("\033[0m", "")
+                    buffer.insert(end_iter, clean_msg + "\n")
+                    
+                    mark = buffer.get_insert()
+                    self.text_view.scroll_to_mark(mark, 0.0, True, 0.5, 1.0)
+                    
+                    if msg_type == "SUCCESS":
+                        self.spinner.stop()
+                        self.spinner_label.set_markup("<span foreground='green'><b>Success!</b> Extension installed and enabled.</span>")
+                        self.status_label.set_markup(f"<b>Installation Complete:</b> {self.uuid}")
+                        
+                        GLib.timeout_add_seconds(2, self.auto_close)
+                    elif msg_type == "ERROR":
+                        self.spinner.stop()
+                        self.spinner_label.set_markup("<span foreground='red'><b>Failed!</b> See logs below.</span>")
+                        self.close_button.set_sensitive(True)
+            except queue.Empty:
+                pass
+            return True
+            
+        def auto_close(self):
+            if gtk_version == 4:
+                self.window.close()
+            else:
+                Gtk.main_quit()
+            return False
+            
+        def run_install(self):
+            def log_to_queue(msg_type, text):
+                self.log_queue.put((msg_type, text))
+                
+            original_info = globals()['log_info']
+            original_success = globals()['log_success']
+            original_warn = globals()['log_warn']
+            original_error = globals()['log_error']
+            
+            globals()['log_info'] = lambda msg: log_to_queue("INFO", f"[INFO] {msg}")
+            globals()['log_success'] = lambda msg: log_to_queue("SUCCESS", f"[SUCCESS] {msg}")
+            globals()['log_warn'] = lambda msg: log_to_queue("WARN", f"[WARNING] {msg}")
+            globals()['log_error'] = lambda msg: log_to_queue("ERROR", f"[ERROR] {msg}")
+            
+            try:
+                success = install_extension(self.uuid)
+                if not success:
+                    log_to_queue("ERROR", "Installation failed.")
+            except Exception as e:
+                log_to_queue("ERROR", f"Exception occurred: {e}")
+            finally:
+                globals()['log_info'] = original_info
+                globals()['log_success'] = original_success
+                globals()['log_warn'] = original_warn
+                globals()['log_error'] = original_error
+                
+        def run(self):
+            if gtk_version == 4:
+                self.app.run([])
+            else:
+                Gtk.main()
+                
+    win = InstallWindow()
+    win.run()
+
 def handle_url(url):
     log_info(f"Handling URL request: {url}")
     parsed = urllib.parse.urlparse(url)
@@ -360,17 +606,14 @@ def handle_url(url):
         log_error(f"Invalid scheme: {parsed.scheme}")
         sys.exit(1)
         
-    # Supported: gnome-ext://install/<uuid> or gnome-ext://install?uuid=<uuid>
     action = parsed.netloc or parsed.path.split('/')[0]
     
     if action == "install":
         uuid = None
-        # Try query parameters first
         queries = urllib.parse.parse_qs(parsed.query)
         if "uuid" in queries:
             uuid = queries["uuid"][0]
             
-        # Try path segment
         if not uuid:
             path_parts = parsed.path.strip('/').split('/')
             if len(path_parts) > 0 and path_parts[0]:
@@ -382,9 +625,29 @@ def handle_url(url):
             sys.exit(1)
             
         log_info(f"URL request received to install extension: {uuid}")
-        send_notification("Installing Extension", f"Downloading and installing {uuid}...")
         
-        # Install
+        gui_available = False
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            try:
+                import gi
+                gi.require_version('Gtk', '4.0')
+                gui_available = True
+            except Exception:
+                try:
+                    import gi
+                    gi.require_version('Gtk', '3.0')
+                    gui_available = True
+                except Exception:
+                    pass
+                    
+        if gui_available:
+            try:
+                run_gui_installer(uuid)
+                sys.exit(0)
+            except Exception as e:
+                log_warn(f"Failed to start GUI installer: {e}. Falling back to CLI installation.")
+                
+        send_notification("Installing Extension", f"Downloading and installing {uuid}...")
         if install_extension(uuid):
             sys.exit(0)
         else:
@@ -420,6 +683,9 @@ def main():
     url_parser = subparsers.add_parser("handle-url", help="Internal use to handle gnome-ext:// URLs")
     url_parser.add_argument("url", help="The URL to handle")
     
+    # Self update
+    subparsers.add_parser("self-update", help="Update the gnome-ext-cli tool itself to the latest version")
+    
     args = parser.parse_args()
     
     if args.command == "install":
@@ -434,6 +700,8 @@ def main():
         setup_autoupdate()
     elif args.command == "handle-url":
         handle_url(args.url)
+    elif args.command == "self-update":
+        self_update()
     else:
         parser.print_help()
 
